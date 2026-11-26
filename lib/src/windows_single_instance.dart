@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -12,6 +13,9 @@ import 'package:win32/win32.dart';
 class WindowsSingleInstance {
   static const MethodChannel _channel = MethodChannel('windows_single_instance');
   static const _kOpenPipeTimeout = Duration(seconds: 5);
+  static const _kReadBufferSize = 4096;
+  static const _kWaitSliceMS = 1000;
+  static const _kReadTimeoutMS = 1000;
 
   static final _waitNamedPipe = DynamicLibrary.open('kernel32.dll').lookupFunction<Int32 Function(Pointer<Utf16>, Uint32), int Function(Pointer<Utf16>, int)>('WaitNamedPipeW');
 
@@ -20,8 +24,9 @@ class WindowsSingleInstance {
   static HANDLE? _openPipe(String filename) {
     final cPipe = filename.toPcwstr();
     try {
+      final timeoutMS = _kOpenPipeTimeout.inMilliseconds;
       final stopwatch = Stopwatch()..start();
-      while (true) {
+      while (stopwatch.elapsedMilliseconds < timeoutMS) {
         final Win32Result(:value, :error) = CreateFile(
           cPipe,
           GENERIC_WRITE,
@@ -33,11 +38,10 @@ class WindowsSingleInstance {
         );
         if (value != INVALID_HANDLE_VALUE) return value;
 
-        final remainingMS = _kOpenPipeTimeout.inMilliseconds - stopwatch.elapsedMilliseconds;
-        if (remainingMS <= 0) return null;
-
         if (error == ERROR_PIPE_BUSY) {
-          _waitNamedPipe(cPipe, remainingMS);
+          final remainingMS = timeoutMS - stopwatch.elapsedMilliseconds;
+          final waitMS = remainingMS.clamp(1, timeoutMS);
+          _waitNamedPipe(cPipe, waitMS);
         } else if (error == ERROR_FILE_NOT_FOUND) {
           // -- first instance didn't create the pipe yet
           sleep(const Duration(milliseconds: 20));
@@ -45,6 +49,7 @@ class WindowsSingleInstance {
           return null;
         }
       }
+      return null;
     } finally {
       free(cPipe);
     }
@@ -74,39 +79,64 @@ class WindowsSingleInstance {
 
   static void _readPipe(SendPort writer, HANDLE pipeHandle) {
     final overlap = calloc<OVERLAPPED>();
+    final Win32Result(value: event) = CreateEvent(null, true, false, null);
+    overlap.ref.hEvent = event;
+    final numTransferred = calloc<Uint32>();
+    final buffer = calloc<Uint8>(_kReadBufferSize);
     try {
       while (true) {
-        final Win32Result(:error) = ConnectNamedPipe(pipeHandle, overlap);
+        final Win32Result(value: didConnect, :error) = ConnectNamedPipe(pipeHandle, overlap);
         if (error == ERROR_INVALID_HANDLE) return;
 
-        const dataSize = 16384;
-        final data = calloc<Uint8>(dataSize);
-        final numRead = calloc<Uint32>();
-        try {
-          // -- otherwise a client is already connected
-          if (error == ERROR_IO_PENDING) {
-            while (!GetOverlappedResult(pipeHandle, overlap, numRead, false).value) {
-              sleep(const Duration(milliseconds: 200));
-            }
+        final isPending = !didConnect && error == ERROR_IO_PENDING;
+        // -- other results can still have a client that connected or already wrote
+        final isConnected = isPending ? _waitOverlapped(pipeHandle, overlap, numTransferred).value : true;
+        final message = isConnected ? _readMessage(pipeHandle, overlap, buffer, numTransferred) : null;
+        if (message != null) {
+          try {
+            writer.send(jsonDecode(message));
+          } catch (error) {
+            stderr.writeln("[MultiInstanceHandler]: ERROR: $error");
           }
-
-          final Win32Result(value: didRead, error: readError) = ReadFile(pipeHandle, data, dataSize, numRead, overlap);
-          if (!didRead && readError == ERROR_IO_PENDING) {
-            GetOverlappedResult(pipeHandle, overlap, numRead, true);
-          }
-          final jsonData = data.cast<Utf8>().toDartString();
-          writer.send(jsonDecode(jsonData));
-        } catch (error) {
-          stderr.writeln("[MultiInstanceHandler]: ERROR: $error");
-        } finally {
-          free(data);
-          free(numRead);
-          DisconnectNamedPipe(pipeHandle);
+        } else if (!isPending) {
+          // -- no busy loop if connecting keeps failing
+          sleep(const Duration(milliseconds: 50));
         }
+        DisconnectNamedPipe(pipeHandle);
       }
     } finally {
+      CloseHandle(event);
+      free(buffer);
+      free(numTransferred);
       free(overlap);
     }
+  }
+
+  static String? _readMessage(HANDLE pipeHandle, Pointer<OVERLAPPED> overlap, Pointer<Uint8> buffer, Pointer<Uint32> numTransferred) {
+    final bytes = BytesBuilder();
+    while (true) {
+      final Win32Result(value: didStartRead, error: startError) = ReadFile(pipeHandle, buffer, _kReadBufferSize, null, overlap);
+      if (!didStartRead && startError != ERROR_IO_PENDING && startError != ERROR_MORE_DATA) return null;
+
+      final Win32Result(value: didRead, :error) = _waitOverlapped(pipeHandle, overlap, numTransferred, timeoutMS: _kReadTimeoutMS);
+      if (!didRead && error != ERROR_MORE_DATA) return null;
+
+      bytes.add(buffer.asTypedList(numTransferred.value));
+      if (didRead) return utf8.decode(bytes.takeBytes());
+    }
+  }
+
+  // -- waits in slices so the isolate can still be killed (hot restart, shutdown)
+  static Win32Result<bool> _waitOverlapped(HANDLE pipeHandle, Pointer<OVERLAPPED> overlap, Pointer<Uint32> numTransferred, {int? timeoutMS}) {
+    final event = overlap.ref.hEvent;
+    final waitMS = timeoutMS ?? _kWaitSliceMS;
+    while (WaitForSingleObject(event, waitMS).value == WAIT_TIMEOUT) {
+      if (timeoutMS != null) {
+        CancelIoEx(pipeHandle, overlap);
+        return GetOverlappedResult(pipeHandle, overlap, numTransferred, true);
+      }
+    }
+    return GetOverlappedResult(pipeHandle, overlap, numTransferred, false);
   }
 
   static void _writePipeData(String filename, List<String>? arguments) {

@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.0.3
+- The listener waits for clients instead of checking every 200ms, recovers from pipe errors, reads messages of any size and keeps messages sent right as it starts
+
 ## 2.0.2
 - Fix second instances losing their arguments when several open at once or while the first one is starting
 
