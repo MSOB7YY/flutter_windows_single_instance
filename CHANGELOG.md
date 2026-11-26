@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.0.2
+- Fix second instances losing their arguments when several open at once or while the first one is starting
+
 ## 1.1.0
 - Support passing a custom exit function to `ensureSingleInstance`
 

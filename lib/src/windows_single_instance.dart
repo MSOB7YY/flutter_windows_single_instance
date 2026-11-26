@@ -11,23 +11,40 @@ import 'package:win32/win32.dart';
 
 class WindowsSingleInstance {
   static const MethodChannel _channel = MethodChannel('windows_single_instance');
-  static const _kErrorPipeConnected = 0x80070217;
+  static const _kOpenPipeTimeout = Duration(seconds: 5);
+
+  static final _waitNamedPipe = DynamicLibrary.open('kernel32.dll').lookupFunction<Int32 Function(Pointer<Utf16>, Uint32), int Function(Pointer<Utf16>, int)>('WaitNamedPipeW');
 
   WindowsSingleInstance._();
 
-  static HANDLE _openPipe(String filename) {
+  static HANDLE? _openPipe(String filename) {
     final cPipe = filename.toPcwstr();
     try {
-      final Win32Result(:value) = CreateFile(
-        cPipe,
-        GENERIC_WRITE,
-        FILE_SHARE_NONE,
-        null,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        null,
-      );
-      return value;
+      final stopwatch = Stopwatch()..start();
+      while (true) {
+        final Win32Result(:value, :error) = CreateFile(
+          cPipe,
+          GENERIC_WRITE,
+          FILE_SHARE_NONE,
+          null,
+          OPEN_EXISTING,
+          FILE_ATTRIBUTE_NORMAL,
+          null,
+        );
+        if (value != INVALID_HANDLE_VALUE) return value;
+
+        final remainingMS = _kOpenPipeTimeout.inMilliseconds - stopwatch.elapsedMilliseconds;
+        if (remainingMS <= 0) return null;
+
+        if (error == ERROR_PIPE_BUSY) {
+          _waitNamedPipe(cPipe, remainingMS);
+        } else if (error == ERROR_FILE_NOT_FOUND) {
+          // -- first instance didn't create the pipe yet
+          sleep(const Duration(milliseconds: 20));
+        } else {
+          return null;
+        }
+      }
     } finally {
       free(cPipe);
     }
@@ -59,27 +76,24 @@ class WindowsSingleInstance {
     final overlap = calloc<OVERLAPPED>();
     try {
       while (true) {
-        while (true) {
-          final Win32Result(:error) = ConnectNamedPipe(pipeHandle, overlap);
-          final err = error;
-          if (err == _kErrorPipeConnected) {
-            sleep(const Duration(milliseconds: 200));
-            continue;
-          } else if (err == ERROR_INVALID_HANDLE) {
-            return;
-          }
-          break;
-        }
+        final Win32Result(:error) = ConnectNamedPipe(pipeHandle, overlap);
+        if (error == ERROR_INVALID_HANDLE) return;
 
         const dataSize = 16384;
         final data = calloc<Uint8>(dataSize);
         final numRead = calloc<Uint32>();
         try {
-          while (!GetOverlappedResult(pipeHandle, overlap, numRead, false).value) {
-            sleep(const Duration(milliseconds: 200));
+          // -- otherwise a client is already connected
+          if (error == ERROR_IO_PENDING) {
+            while (!GetOverlappedResult(pipeHandle, overlap, numRead, false).value) {
+              sleep(const Duration(milliseconds: 200));
+            }
           }
 
-          ReadFile(pipeHandle, data, dataSize, numRead, overlap);
+          final Win32Result(value: didRead, error: readError) = ReadFile(pipeHandle, data, dataSize, numRead, overlap);
+          if (!didRead && readError == ERROR_IO_PENDING) {
+            GetOverlappedResult(pipeHandle, overlap, numRead, true);
+          }
           final jsonData = data.cast<Utf8>().toDartString();
           writer.send(jsonDecode(jsonData));
         } catch (error) {
@@ -97,6 +111,7 @@ class WindowsSingleInstance {
 
   static void _writePipeData(String filename, List<String>? arguments) {
     final pipe = _openPipe(filename);
+    if (pipe == null) return;
     final bytesString = jsonEncode(arguments ?? []);
     final bytes = bytesString.toNativeUtf8();
     final numWritten = malloc<Uint32>();
